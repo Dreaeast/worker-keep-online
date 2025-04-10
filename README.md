@@ -4,6 +4,8 @@
 
 这是一个基于Cloudflare Workers的URL访问工具，可以定期访问指定的URL列表。该工具从GitHub私有仓库读取URL配置，支持24小时不间断访问和按时间段访问。
 
+修改自老王的https://github.com/eooce/Auto-keep-online.git项目
+
 ## 功能特点
 
 - 从GitHub私有仓库读取URL配置
