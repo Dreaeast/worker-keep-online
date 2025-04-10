@@ -1,31 +1,32 @@
-// 此js为cloudflared workers使用，复制整个代码到新建的workers里，修改需要访问的链接或部署后添加环境变量
-// 在设置---触发事件 里设置访问频率，例如2分钟，保存即可，可开启日志查看，检查是否运行
+// Cloudflare worker for keeping services alive by periodic visits
+// After copying this code to your workers, modify the required URLs or add environment variables
 
-// Telegram配置(不需要可忽略)
-const TG_ID = '';           // 替换为你的Telegram用户chat_id
-const TG_TOKEN = '';        // 替换为你的Telegram Bot的token
+// Environment variable configuration: All settings below can be overridden by environment variables
+// Telegram configuration (optional)
+const TG_ID = globalThis['TG_ID'] || '';                // Set your Telegram chat_id in environment variable 'TG_ID'
+const TG_TOKEN = globalThis['TG_TOKEN'] || '';          // Set your Telegram Bot token in environment variable 'TG_TOKEN'
 
-// GitHub配置
-const GITHUB_TOKEN = '';    // 替换为你的GitHub个人访问令牌
-const GITHUB_REPO = '';     // 替换为你的仓库名称，格式：用户名/仓库名
-const GITHUB_BRANCH = 'main'; // 替换为你的分支名，默认为main
+// GitHub configuration
+const GITHUB_TOKEN = globalThis['GITHUB_TOKEN'] || '';  // Set your GitHub personal access token in environment variable 'GITHUB_TOKEN'
+const GITHUB_REPO = globalThis['GITHUB_REPO'] || '';    // Set your repository name in format 'username/repo' in environment variable 'GITHUB_REPO'
+const GITHUB_BRANCH = globalThis['GITHUB_BRANCH'] || 'main'; // Set your branch name in environment variable 'GITHUB_BRANCH'
 
-// 24小时不间断访问的URL数组,可添加环境变量，环境变量名格式：URL_1 URL_2 URL_3...
-const defaultUrls = [            
-  'https://www.google.com',             
-  'https://www.google.com',
-  'https://www.google.com'  // 可添加多个URL，每个URL之间用英文逗号分隔,最后一个URL后不要加逗号
-];
+// Default URLs for 24-hour access can be added as environment variables: URL_1, URL_2, URL_3...
+const defaultUrls = [];
 
-// 指定时间段(1:00～5:00)访问的URL数组,可添加环境变量，环境变量名格式：WEBSITE_1 WEBSITE_2 WEBSITE_3...
-const defaultWebsites = [
-  'https://www.baidu.com',
-  'https://www.baidu.com',
-  'https://www.baidu.com'  // 可添加多个URL，每个URL之间用英文逗号分隔,最后一个URL后不要加逗号
-  // ... 添加更多URL
-];
+// Default websites for specific time period access (1:00～5:00) can be added as environment variables: WEBSITE_1, WEBSITE_2, WEBSITE_3...
+const defaultWebsites = [];
 
-// 从环境变量获取URL数组
+// URL file paths in GitHub repository (can be overridden by environment variables)
+const URL_24H_FILE = globalThis['URL_24H_FILE'] || 'url.yaml';
+const TIME_URL_FILES = globalThis['TIME_URL_FILES'] ? globalThis['TIME_URL_FILES'].split(',') : ['url1.yaml', 'url2.yaml', 'url3.yaml'];
+
+// Time configuration (can be overridden by environment variables)
+const PAUSE_START_HOUR = parseInt(globalThis['PAUSE_START_HOUR'] || '1');
+const PAUSE_END_HOUR = parseInt(globalThis['PAUSE_END_HOUR'] || '6');
+const TIMEZONE = globalThis['TIMEZONE'] || 'Asia/Hong_Kong';
+
+// Get URLs from environment variables
 function getUrlsFromEnv(prefix) {
   const envUrls = [];
   let index = 1;
@@ -38,74 +39,159 @@ function getUrlsFromEnv(prefix) {
   return envUrls;
 }
 
-// 从GitHub仓库获取文件内容
+// Get file from GitHub repository with multiple methods
 async function getFileFromGitHub(path) {
   if (!GITHUB_TOKEN || !GITHUB_REPO) {
-    console.log('GitHub配置不完整，跳过GitHub URL获取');
+    console.log('GitHub configuration incomplete, skipping GitHub URL retrieval');
     return '';
   }
 
+  const username = GITHUB_REPO.split('/')[0];
+  const repo = GITHUB_REPO.split('/')[1];
+  
+  if (!username || !repo) {
+    console.error(`Invalid GITHUB_REPO format: ${GITHUB_REPO}. Expected format: username/repo`);
+    return '';
+  }
+
+  // Try API method first
   try {
-    const url = `https://api.github.com/repos/${GITHUB_REPO}/contents/${path}?ref=${GITHUB_BRANCH}`;
-    const response = await fetch(url, {
+    console.log(`Attempting to fetch ${path} via GitHub API...`);
+    const apiUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${path}?ref=${GITHUB_BRANCH}`;
+    const apiResponse = await fetch(apiUrl, {
       headers: {
         'Authorization': `token ${GITHUB_TOKEN}`,
-        'Accept': 'application/vnd.github.v3.raw'
+        'Accept': 'application/vnd.github.v3.raw',
+        'User-Agent': 'CloudflareWorker'
       }
     });
 
-    if (!response.ok) {
-      console.error(`获取GitHub文件失败: ${path}, 状态码: ${response.status}`);
-      return '';
+    if (apiResponse.ok) {
+      const content = await apiResponse.text();
+      console.log(`Successfully retrieved ${path} from GitHub API (${content.length} bytes)`);
+      return content;
+    } else {
+      console.log(`GitHub API method failed with status ${apiResponse.status}. Trying raw URL method...`);
     }
+  } catch (apiError) {
+    console.error(`Error with GitHub API method: ${apiError.message}. Trying raw URL method...`);
+  }
 
-    return await response.text();
-  } catch (error) {
-    console.error(`获取GitHub文件出错: ${path}, 错误: ${error.message}`);
+  // If API method fails, try raw URL method
+  try {
+    // For private repos, we can use a different URL format that accepts the token as a query parameter
+    // This works for both public and private repos
+    const rawUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${path}`;
+    
+    const rawResponse = await fetch(rawUrl, {
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'User-Agent': 'CloudflareWorker'
+      }
+    });
+
+    if (rawResponse.ok) {
+      const content = await rawResponse.text();
+      console.log(`Successfully retrieved ${path} from GitHub raw URL (${content.length} bytes)`);
+      return content;
+    } else {
+      // If that fails too, try one more method that sometimes works for private repos
+      console.log(`Raw URL method failed with status ${rawResponse.status}. Trying alternate method...`);
+      
+      const altUrl = `https://api.github.com/repos/${GITHUB_REPO}/git/blobs/${await getBlobSha(path)}`;
+      const altResponse = await fetch(altUrl, {
+        headers: {
+          'Authorization': `token ${GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github.v3.raw',
+          'User-Agent': 'CloudflareWorker'
+        }
+      });
+      
+      if (altResponse.ok) {
+        const content = await altResponse.text();
+        console.log(`Successfully retrieved ${path} using blob method (${content.length} bytes)`);
+        return content;
+      } else {
+        console.error(`All GitHub access methods failed for ${path}. Last status: ${altResponse.status}`);
+        return '';
+      }
+    }
+  } catch (rawError) {
+    console.error(`Error with GitHub raw URL method: ${rawError.message}`);
     return '';
   }
 }
 
-// 解析文件内容，提取URL
+// Helper function to get blob SHA for a file
+async function getBlobSha(path) {
+  try {
+    const url = `https://api.github.com/repos/${GITHUB_REPO}/git/trees/${GITHUB_BRANCH}?recursive=1`;
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'User-Agent': 'CloudflareWorker'
+      }
+    });
+    
+    if (!response.ok) {
+      console.error(`Could not get repository tree: ${response.status}`);
+      return null;
+    }
+    
+    const data = await response.json();
+    const file = data.tree.find(item => item.path === path);
+    
+    if (file) {
+      return file.sha;
+    } else {
+      console.error(`File ${path} not found in repository tree`);
+      return null;
+    }
+  } catch (error) {
+    console.error(`Error getting blob SHA: ${error.message}`);
+    return null;
+  }
+}
+
+// Parse content to extract URLs
 function parseUrlsFromContent(content) {
   if (!content) return [];
   
   return content
     .split('\n')
     .map(line => line.trim())
-    .filter(line => line && !line.startsWith('#')) // 过滤空行和注释行
+    .filter(line => line && !line.startsWith('#')) // Filter empty lines and comments
     .filter(url => {
       try {
-        new URL(url); // 验证URL格式
+        new URL(url); // Validate URL format
         return true;
       } catch (e) {
-        console.error(`无效的URL: ${url}`);
+        console.error(`Invalid URL: ${url}`);
         return false;
       }
     });
 }
 
-// 从GitHub获取URL列表
+// Get URL lists from GitHub
 async function getUrlsFromGitHub() {
-  // 从url.yaml获取24小时不间断访问的URL列表
-  const url24hContent = await getFileFromGitHub('url.yaml');
+  // Get 24-hour URLs from URL_24H_FILE
+  const url24hContent = await getFileFromGitHub(URL_24H_FILE);
   const url24hList = parseUrlsFromContent(url24hContent);
-  console.log(`从GitHub的url.yaml获取到${url24hList.length}个24小时访问URL`);
+  console.log(`Retrieved ${url24hList.length} 24-hour URLs from GitHub (${URL_24H_FILE})`);
   
-  // 从三个yaml文件获取指定时间段访问的URL列表
-  const timeUrlFiles = ['url1.yaml', 'url2.yaml', 'url3.yaml'];
+  // Get time-specific URLs from TIME_URL_FILES
   let timeUrlList = [];
   
-  for (const file of timeUrlFiles) {
+  for (const file of TIME_URL_FILES) {
     const content = await getFileFromGitHub(file);
     const urls = parseUrlsFromContent(content);
     if (urls.length > 0) {
-      console.log(`从GitHub的${file}获取到${urls.length}个URL`);
+      console.log(`Retrieved ${urls.length} URLs from GitHub (${file})`);
       timeUrlList = [...timeUrlList, ...urls];
     }
   }
   
-  console.log(`从GitHub总共获取到${timeUrlList.length}个指定时间段访问URL`);
+  console.log(`Total of ${timeUrlList.length} time-specific URLs retrieved from GitHub`);
   
   return {
     url24hList,
@@ -113,12 +199,12 @@ async function getUrlsFromGitHub() {
   };
 }
 
-// 检查是否在暂停时间内 (1:00-5:00)
+// Check if current hour is in pause time
 function isInPauseTime(hour) {
-  return hour >= 1 && hour < 5;
+  return hour >= PAUSE_START_HOUR && hour < PAUSE_END_HOUR;
 }
 
-// 发送消息到Telegram
+// Send message to Telegram
 async function sendToTelegram(message) {
   if (!TG_TOKEN || !TG_ID) return;
   
@@ -126,6 +212,7 @@ async function sendToTelegram(message) {
   const body = JSON.stringify({
     chat_id: TG_ID,
     text: message,
+    parse_mode: 'HTML'
   });
 
   try {
@@ -136,25 +223,27 @@ async function sendToTelegram(message) {
     });
 
     if (!response.ok) {
-      console.error(`Telegram推送失败: ${response.statusText}`);
+      console.error(`Telegram push failed: ${response.statusText}`);
+    } else {
+      console.log('Telegram message sent successfully');
     }
   } catch (error) {
-    console.error(`Telegram推送出错: ${error.message}`);
+    console.error(`Telegram push error: ${error.message}`);
   }
 }
 
-// 生成随机IP
+// Generate random IP
 function getRandomIP() {
   return `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
 }
 
-// 生成随机版本号
+// Generate random Chrome version
 function getRandomVersion() {
   const chromeVersion = Math.floor(Math.random() * (131 - 100 + 1)) + 100;
   return chromeVersion;
 }
 
-// 获取随机 User-Agent
+// Get random User-Agent
 function getRandomUserAgent() {
   const agents = [
     `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${getRandomVersion()}.0.0.0 Safari/537.36`,
@@ -167,7 +256,7 @@ function getRandomUserAgent() {
 
 async function axiosLikeRequest(url, index, retryCount = 0) {
   try {
-    // 随机延迟 1-6 秒
+    // Random delay 1-6 seconds
     await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 5000));
     
     const config = {
@@ -191,7 +280,7 @@ async function axiosLikeRequest(url, index, retryCount = 0) {
         'Referer': 'https://glitch.com/'
       },
       redirect: 'follow',
-      timeout: 30000
+      timeout: parseInt(globalThis['REQUEST_TIMEOUT'] || '30000')
     };
 
     const controller = new AbortController();
@@ -204,11 +293,11 @@ async function axiosLikeRequest(url, index, retryCount = 0) {
 
     clearTimeout(timeoutId);
     const status = response.status;
-    const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Hong_Kong' });
+    const timestamp = new Date().toLocaleString('zh-CN', { timeZone: TIMEZONE });
     
     if (status !== 200) {
-      // 非200状态码发送通知
-      await sendToTelegram(`保活日志：${timestamp}\n访问失败: ${url}\n状态码: ${status}`);
+      // Send notification for non-200 status codes
+      await sendToTelegram(`<b>Keep-alive Log:</b> ${timestamp}\n<b>Access Failed:</b> ${url}\n<b>Status Code:</b> ${status}`);
     }
     
     return {
@@ -220,15 +309,15 @@ async function axiosLikeRequest(url, index, retryCount = 0) {
     };
     
   } catch (error) {
-    if (retryCount < 2) {
-      // 如果出错且重试次数小于2，等待后重试
+    if (retryCount < parseInt(globalThis['MAX_RETRIES'] || '2')) {
+      // Retry if error count is less than MAX_RETRIES
       await new Promise(resolve => setTimeout(resolve, 10000));
       return axiosLikeRequest(url, index, retryCount + 1);
     }
-    const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Hong_Kong' });
-    // 发送错误通知
-    await sendToTelegram(`保活日志：${timestamp}\n访问出错: ${url}\n错误信息: ${error.message}`);
-    console.error(`${timestamp} 访问失败: ${url} 状态码: 500`);
+    const timestamp = new Date().toLocaleString('zh-CN', { timeZone: TIMEZONE });
+    // Send error notification
+    await sendToTelegram(`<b>Keep-alive Log:</b> ${timestamp}\n<b>Access Error:</b> ${url}\n<b>Error Message:</b> ${error.message}`);
+    console.error(`${timestamp} Access Failed: ${url} Status Code: 500`);
     return {
       index,
       url,
@@ -240,76 +329,89 @@ async function axiosLikeRequest(url, index, retryCount = 0) {
 }
 
 async function handleScheduled() {
-  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Hong_Kong' }));
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: TIMEZONE }));
   const hour = now.getHours();
   const timestamp = now.toLocaleString();
   
-  console.log(`开始执行定时任务: ${timestamp}`);
+  console.log(`Starting scheduled task: ${timestamp}`);
   
-  // 从GitHub获取URL列表
+  // Get URL lists from GitHub
   const githubUrls = await getUrlsFromGitHub();
   
-  // 合并所有24小时访问URL源
+  // Combine all 24-hour access URL sources
   const allUrls = [
     ...defaultUrls,
     ...getUrlsFromEnv('URL_'),
     ...(githubUrls.url24hList || [])
-  ];
+  ].filter(url => url); // Filter out empty URLs
   
-  // 合并所有指定时间段访问URL源
+  // Combine all time-specific access URL sources
   const allWebsites = [
     ...defaultWebsites,
     ...getUrlsFromEnv('WEBSITE_'),
     ...(githubUrls.timeUrlList || [])
-  ];
+  ].filter(url => url); // Filter out empty URLs
   
-  console.log(`总计24小时访问URL: ${allUrls.length}个`);
-  console.log(`总计指定时间段访问URL: ${allWebsites.length}个`);
+  console.log(`Total 24-hour access URLs: ${allUrls.length}`);
+  console.log(`Total time-specific access URLs: ${allWebsites.length}`);
 
-  // 24小时访问 - 并行执行但保持顺序
-  const results = await Promise.all(allUrls.map((url, index) => axiosLikeRequest(url, index)));
-  
-  // 按原始顺序排序并打印结果
-  results.sort((a, b) => a.index - b.index).forEach(result => {
-    if (result.success) {
-      console.log(`${result.timestamp} 访问成功: ${result.url}`);
-    } else {
-      console.error(`${result.timestamp} 访问失败: ${result.url} 状态码: ${result.status}`);
-    }
-  });
-
-  // 检查是否在暂停时间
-  if (!isInPauseTime(hour)) {
-    console.log(`当前时间 ${hour}:00, 执行指定时间段访问任务`);
-    const websiteResults = await Promise.all(allWebsites.map((url, index) => axiosLikeRequest(url, index)));
+  // Execute 24-hour access tasks - parallel but maintain order
+  if (allUrls.length > 0) {
+    const results = await Promise.all(allUrls.map((url, index) => axiosLikeRequest(url, index)));
     
-    websiteResults.sort((a, b) => a.index - b.index).forEach(result => {
+    // Sort by original order and print results
+    results.sort((a, b) => a.index - b.index).forEach(result => {
       if (result.success) {
-        console.log(`${result.timestamp} 访问成功: ${result.url}`);
+        console.log(`${result.timestamp} Access successful: ${result.url}`);
       } else {
-        console.error(`${result.timestamp} 访问失败: ${result.url} 状态码: ${result.status}`);
+        console.error(`${result.timestamp} Access failed: ${result.url} Status code: ${result.status}`);
       }
     });
   } else {
-    console.log(`当前处于暂停时间 1:00-5:00 --- ${timestamp}, 跳过指定时间段访问任务`);
+    console.log('No 24-hour URLs configured. Skipping 24-hour access tasks.');
+  }
+
+  // Check if in pause time
+  if (!isInPauseTime(hour)) {
+    console.log(`Current time ${hour}:00, executing time-specific access tasks`);
+    if (allWebsites.length > 0) {
+      const websiteResults = await Promise.all(allWebsites.map((url, index) => axiosLikeRequest(url, index)));
+      
+      websiteResults.sort((a, b) => a.index - b.index).forEach(result => {
+        if (result.success) {
+          console.log(`${result.timestamp} Access successful: ${result.url}`);
+        } else {
+          console.error(`${result.timestamp} Access failed: ${result.url} Status code: ${result.status}`);
+        }
+      });
+    } else {
+      console.log('No time-specific URLs configured. Skipping time-specific access tasks.');
+    }
+  } else {
+    console.log(`Currently in pause time ${PAUSE_START_HOUR}:00-${PAUSE_END_HOUR}:00 --- ${timestamp}, skipping time-specific access tasks`);
   }
   
-  console.log(`定时任务执行完成: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Hong_Kong' })}`);
+  console.log(`Scheduled task completed: ${new Date().toLocaleString('zh-CN', { timeZone: TIMEZONE })}`);
+  
+  // Send status summary to Telegram if enabled
+  if (globalThis['SEND_SUMMARY'] === 'true') {
+    await sendToTelegram(`<b>Keep-alive Summary:</b> ${timestamp}\n<b>24-hour URLs:</b> ${allUrls.length}\n<b>Time-specific URLs:</b> ${allWebsites.length}\n<b>Task completed</b>`);
+  }
 }
 
-// 处理HTTP请求
+// Handle HTTP requests
 async function handleRequest() {
   return new Response("Worker is running!", {
     headers: { 'content-type': 'text/plain' },
   });
 }
 
-// 监听请求
+// Listen for requests
 addEventListener('fetch', event => {
   event.respondWith(handleRequest());
 });
 
-// 监听定时任务
+// Listen for scheduled tasks
 addEventListener('scheduled', event => {
   event.waitUntil(handleScheduled());
 });
