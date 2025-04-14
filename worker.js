@@ -292,11 +292,28 @@ async function axiosLikeRequest(url, index, retryCount = 0) {
     });
 
     clearTimeout(timeoutId);
+    
+    // Start measuring the time taken to fully load the content
+    const responseStartTime = Date.now();
+    
+    // Wait for and read the response body - this ensures we wait for the complete page load
+    try {
+      const responseText = await response.text();
+      const loadTime = Date.now() - responseStartTime;
+      console.log(`Loaded ${url} in ${loadTime}ms, content length: ${responseText.length} bytes`);
+    } catch (readError) {
+      console.error(`Error reading response body for ${url}: ${readError.message}`);
+      // Continue anyway as we at least got a response status
+    }
+    
     const status = response.status;
     const timestamp = new Date().toLocaleString('zh-CN', { timeZone: TIMEZONE });
     
-    if (status !== 200) {
-      // Send notification for non-200 status codes
+    // Consider any 2xx status code as success
+    const isSuccess = status >= 200 && status < 300;
+    
+    if (!isSuccess) {
+      // Send notification for non-success status codes
       await sendToTelegram(`<b>Keep-alive Log:</b> ${timestamp}\n<b>Access Failed:</b> ${url}\n<b>Status Code:</b> ${status}`);
     }
     
@@ -304,26 +321,35 @@ async function axiosLikeRequest(url, index, retryCount = 0) {
       index,
       url,
       status,
-      success: status === 200,
+      success: isSuccess,
       timestamp
     };
     
   } catch (error) {
+    // Check if it's a timeout error
+    const isTimeout = error.name === 'AbortError' || error.message.includes('timeout');
+    const errorMsg = isTimeout ? 'Request timed out' : error.message;
+    
     if (retryCount < parseInt(globalThis['MAX_RETRIES'] || '2')) {
-      // Retry if error count is less than MAX_RETRIES
-      await new Promise(resolve => setTimeout(resolve, 10000));
+      console.log(`Retry ${retryCount + 1} for ${url} due to: ${errorMsg}`);
+      // Exponential backoff for retries
+      const backoffTime = 10000 * Math.pow(2, retryCount);
+      await new Promise(resolve => setTimeout(resolve, backoffTime));
       return axiosLikeRequest(url, index, retryCount + 1);
     }
+    
     const timestamp = new Date().toLocaleString('zh-CN', { timeZone: TIMEZONE });
     // Send error notification
-    await sendToTelegram(`<b>Keep-alive Log:</b> ${timestamp}\n<b>Access Error:</b> ${url}\n<b>Error Message:</b> ${error.message}`);
-    console.error(`${timestamp} Access Failed: ${url} Status Code: 500`);
+    await sendToTelegram(`<b>Keep-alive Log:</b> ${timestamp}\n<b>Access Error:</b> ${url}\n<b>Error Message:</b> ${errorMsg}`);
+    console.error(`${timestamp} Access Failed: ${url} Error: ${errorMsg}`);
+    
     return {
       index,
       url,
-      status: 500,
+      status: isTimeout ? 408 : 500, // Use 408 for timeout, 500 for other errors
       success: false,
-      timestamp
+      timestamp,
+      error: errorMsg
     };
   }
 }
